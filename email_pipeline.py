@@ -35,10 +35,12 @@ from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 # ── Local modules ──────────────────────────────────────────────────────────────
 from extract_text import extract_text as extract_docx_text   # for DOCX/DOC
-from krutidev_converter import krutidev_to_unicode            # for heuristic check
+from krutidev_converter import krutidev_to_unicode, unicode_to_krutidev  # for heuristic check / reverse
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 from config import (
@@ -185,7 +187,7 @@ def _detect_and_convert_text(raw_text: str, file_path: str | None = None,
     return raw_text, "English"
 
 
-def extract_and_save_text(file_path: str) -> tuple[str, str]:
+def extract_and_save_text(file_path: str) -> tuple[str, str, str]:
     """
     Extract text from *file_path*, detect language, convert if needed.
 
@@ -193,6 +195,7 @@ def extract_and_save_text(file_path: str) -> tuple[str, str]:
     -------
     txt_path : str   – path of the saved .txt file
     text     : str   – extracted (and possibly converted) text
+    lang     : str   – detected language ("English", "Unicode Hindi", "Krutidev→Unicode")
     """
     ext = os.path.splitext(file_path)[1].lower()
 
@@ -214,7 +217,7 @@ def extract_and_save_text(file_path: str) -> tuple[str, str]:
 
     else:
         log(f"  [STEP 3] Unsupported extension '{ext}' — skipping.")
-        return "", ""
+        return "", "", "English"
 
     log(f"  [STEP 3] Language: {lang} | Characters extracted: {len(text):,}")
 
@@ -225,7 +228,7 @@ def extract_and_save_text(file_path: str) -> tuple[str, str]:
         f.write(text)
     log(f"  [STEP 3] Saved TXT → {txt_path}")
 
-    return txt_path, text
+    return txt_path, text, lang
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -312,7 +315,8 @@ def get_columns_from_gemini(text: str) -> dict[str, list[str]]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def call_openclaw(subject: str, sender: str, body: str,
-                  columns_by_page: dict[str, list[str]]) -> dict | None:
+                  columns_by_page: dict[str, list[str]],
+                  language: str = "English") -> dict | None:
     """
     Sends email context + detected column headers to OpenClaw using the
     email-context-responder skill.
@@ -344,7 +348,18 @@ def call_openclaw(subject: str, sender: str, body: str,
                 all_columns.append(c)
                 seen.add(c)
 
+    # Determine human-readable language label for the prompt
+    is_krutidev = language == "Krutidev→Unicode"
+    is_hindi    = language in ("Unicode Hindi", "Krutidev→Unicode")
+    # We always ask OpenClaw to respond in Unicode Hindi (Devanagari).
+    # If the original was Krutidev, we reverse-convert the reply ourselves.
+    lang_label = "Hindi (Devanagari Unicode script)" if is_hindi else "English"
+
     prompt = f"""Use the email-context-responder skill.
+
+IMPORTANT: The email and its attachments are written in {lang_label}.
+Your entire response — including the 'suggested_reply' field and all table data —
+MUST be written in {lang_label}. Do NOT translate to any other language.
 
 DETECTED COLUMNS (from attachment): {json.dumps(all_columns, ensure_ascii=False)}
 
@@ -395,11 +410,133 @@ def _parse_json(raw: str) -> dict | None:
 # STEP 6 — Build reply PDF
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Krutidev font registration helper ─────────────────────────────────────────
+
+_KRUTIDEV_FONT_REGISTERED = False
+_KRUTIDEV_FONT_NAME       = "KrutiDev010"
+
+_KRUTIDEV_SEARCH_PATHS = [
+    r"C:\Windows\Fonts\KRDEV010.TTF",
+    r"C:\Windows\Fonts\KrutiDev010.ttf",
+    r"C:\Windows\Fonts\Kruti Dev 010.ttf",
+    os.path.join(os.path.dirname(__file__), "KRDEV010.TTF"),
+    os.path.join(os.path.dirname(__file__), "KrutiDev010.ttf"),
+    os.path.join(os.path.dirname(__file__), "Kruti Dev 010.ttf"),
+]
+
+
+def _ensure_krutidev_font() -> tuple[str, str]:
+    """
+    Register Kruti Dev 010 with ReportLab (once).
+    Returns (regular_font_name, bold_font_name).
+    Falls back to NotoSansDevanagari (variable font) if Kruti Dev is absent.
+    """
+    global _KRUTIDEV_FONT_REGISTERED
+    if _KRUTIDEV_FONT_REGISTERED:
+        return _KRUTIDEV_FONT_NAME, _KRUTIDEV_FONT_NAME
+
+    path = next((p for p in _KRUTIDEV_SEARCH_PATHS if os.path.exists(p)), None)
+    if not path:
+        log("  [STEP 6] WARNING: Kruti Dev 010 font not found. "
+            "Falling back to NotoSansDevanagari for Krutidev PDF. "
+            "Install KRDEV010.TTF / KrutiDev010.ttf in C:\\Windows\\Fonts\\ "
+            "or place it next to email_pipeline.py.")
+        # Fall back to NotoSansDevanagari so at least Unicode Hindi renders
+        return _ensure_hindi_font()
+
+    try:
+        pdfmetrics.registerFont(TTFont(_KRUTIDEV_FONT_NAME, path))
+        _KRUTIDEV_FONT_REGISTERED = True
+        log(f"  [STEP 6] Kruti Dev font registered: {path}")
+        return _KRUTIDEV_FONT_NAME, _KRUTIDEV_FONT_NAME
+    except Exception as e:
+        log(f"  [STEP 6] Kruti Dev font registration failed: {e} — falling back.")
+        return _ensure_hindi_font()
+
+
+# ── Hindi font registration helper ────────────────────────────────────────────
+
+_HINDI_FONT_REGISTERED = False
+_HINDI_FONT_NAME = "NotoSansDevanagari"
+_HINDI_FONT_BOLD_NAME = "NotoSansDevanagari-Bold"
+
+# Common install paths for Noto Sans Devanagari on Windows
+_NOTO_SEARCH_PATHS = [
+    # Variable font (placed next to email_pipeline.py)
+    os.path.join(os.path.dirname(__file__), "NotoSansDevanagari-VariableFont_wdth,wght.ttf"),
+    # Standard static font names (Windows Fonts or project folder)
+    r"C:\Windows\Fonts\NotoSansDevanagari-Regular.ttf",
+    r"C:\Windows\Fonts\NotoSansDevanagari.ttf",
+    os.path.join(os.path.dirname(__file__), "NotoSansDevanagari-Regular.ttf"),
+    os.path.join(os.path.dirname(__file__), "NotoSansDevanagari.ttf"),
+]
+_NOTO_BOLD_SEARCH_PATHS = [
+    r"C:\Windows\Fonts\NotoSansDevanagari-Bold.ttf",
+    os.path.join(os.path.dirname(__file__), "NotoSansDevanagari-Bold.ttf"),
+    # Fallback: reuse the variable font as bold
+    os.path.join(os.path.dirname(__file__), "NotoSansDevanagari-VariableFont_wdth,wght.ttf"),
+]
+
+
+def _ensure_hindi_font() -> tuple[str, str]:
+    """
+    Register Noto Sans Devanagari with ReportLab (once).
+    Returns (regular_font_name, bold_font_name).
+    Falls back to Helvetica if the font file is not found.
+    """
+    global _HINDI_FONT_REGISTERED
+    if _HINDI_FONT_REGISTERED:
+        return _HINDI_FONT_NAME, _HINDI_FONT_BOLD_NAME
+
+    reg_path  = next((p for p in _NOTO_SEARCH_PATHS  if os.path.exists(p)), None)
+    bold_path = next((p for p in _NOTO_BOLD_SEARCH_PATHS if os.path.exists(p)), None)
+
+    if not reg_path:
+        log("  [STEP 6] WARNING: Noto Sans Devanagari font not found. "
+            "Hindi text may not render correctly. "
+            "Place NotoSansDevanagari-Regular.ttf next to email_pipeline.py "
+            "or install it in C:\\Windows\\Fonts\\.")
+        return "Helvetica", "Helvetica-Bold"
+
+    try:
+        pdfmetrics.registerFont(TTFont(_HINDI_FONT_NAME, reg_path))
+        if bold_path:
+            pdfmetrics.registerFont(TTFont(_HINDI_FONT_BOLD_NAME, bold_path))
+        else:
+            # Re-register regular as bold fallback
+            pdfmetrics.registerFont(TTFont(_HINDI_FONT_BOLD_NAME, reg_path))
+        _HINDI_FONT_REGISTERED = True
+        log(f"  [STEP 6] Hindi font registered: {reg_path}")
+        return _HINDI_FONT_NAME, _HINDI_FONT_BOLD_NAME
+    except Exception as e:
+        log(f"  [STEP 6] Font registration failed: {e} — falling back to Helvetica.")
+        return "Helvetica", "Helvetica-Bold"
+
+
 def create_reply_pdf(table_data: dict, subject: str, facts: list,
-                     output_path: str) -> str:
-    """Create a styled PDF with table + facts. Returns output_path."""
+                     output_path: str, language: str = "English") -> str:
+    """
+    Create a styled PDF with table + facts in the detected language.
+    - "Krutidev→Unicode" : convert text back to Krutidev ASCII, use Kruti Dev font
+    - "Unicode Hindi"    : use NotoSansDevanagari font
+    - "English"          : use Helvetica
+    Returns output_path.
+    """
     headers = table_data.get("headers", [])
     rows    = table_data.get("rows", [])
+
+    is_krutidev = language == "Krutidev→Unicode"
+    is_hindi    = language in ("Unicode Hindi", "Krutidev→Unicode")
+
+    if is_krutidev:
+        body_font, bold_font = _ensure_krutidev_font()
+        log(f"  [STEP 6] PDF language: Krutidev — using font '{body_font}'")
+    elif is_hindi:
+        body_font, bold_font = _ensure_hindi_font()
+        log(f"  [STEP 6] PDF language: Unicode Hindi — using font '{body_font}'")
+    else:
+        body_font, bold_font = "Helvetica", "Helvetica-Bold"
+        log("  [STEP 6] PDF language: English — using Helvetica")
 
     page_size = landscape(A4) if len(headers) > 5 else A4
     doc = SimpleDocTemplate(
@@ -414,22 +551,24 @@ def create_reply_pdf(table_data: dict, subject: str, facts: list,
 
     # ── Title ──────────────────────────────────────────────────────────────
     title_style = ParagraphStyle(
-        "Title2", parent=styles["Title"], fontSize=14, spaceAfter=10
+        "Title2", parent=styles["Title"], fontSize=14, spaceAfter=10,
+        fontName=bold_font
     )
     story.append(Paragraph(f"Response: {subject}", title_style))
     story.append(Paragraph(
         f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        styles["Normal"]
+        ParagraphStyle("GenDate", parent=styles["Normal"], fontName=body_font)
     ))
     story.append(Spacer(1, 0.5 * cm))
 
     # ── Styles for table cells ─────────────────────────────────────────────
     cell_style = ParagraphStyle(
-        "Cell", parent=styles["Normal"], fontSize=8, leading=10
+        "Cell", parent=styles["Normal"], fontSize=8, leading=10,
+        fontName=body_font
     )
     hdr_style = ParagraphStyle(
         "Hdr", parent=styles["Normal"], fontSize=8, leading=10,
-        textColor=colors.white, fontName="Helvetica-Bold"
+        textColor=colors.white, fontName=bold_font
     )
 
     if headers:
@@ -444,7 +583,7 @@ def create_reply_pdf(table_data: dict, subject: str, facts: list,
         tbl.setStyle(TableStyle([
             ("BACKGROUND",     (0, 0), (-1, 0), colors.HexColor("#2C3E50")),
             ("TEXTCOLOR",      (0, 0), (-1, 0), colors.white),
-            ("FONTNAME",       (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTNAME",       (0, 0), (-1, 0), bold_font),
             ("ROWBACKGROUNDS", (0, 1), (-1, -1),
                 [colors.white, colors.HexColor("#F2F2F2")]),
             ("GRID",           (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
@@ -457,16 +596,21 @@ def create_reply_pdf(table_data: dict, subject: str, facts: list,
         story.append(tbl)
     else:
         story.append(Paragraph(
-            "No structured table data was returned by OpenClaw.", styles["Normal"]
+            "No structured table data was returned by OpenClaw.",
+            ParagraphStyle("Fallback", parent=styles["Normal"], fontName=body_font)
         ))
 
     # ── Source facts ───────────────────────────────────────────────────────
     if facts:
         story.append(Spacer(1, 0.8 * cm))
-        story.append(Paragraph("Source Facts", styles["Heading2"]))
+        story.append(Paragraph(
+            "Source Facts" if not is_hindi else "स्रोत तथ्य",
+            ParagraphStyle("H2", parent=styles["Heading2"], fontName=bold_font)
+        ))
         story.append(Spacer(1, 0.2 * cm))
         fact_style = ParagraphStyle(
-            "Fact", parent=styles["Normal"], fontSize=8, leading=12, leftIndent=10
+            "Fact", parent=styles["Normal"], fontSize=8, leading=12,
+            leftIndent=10, fontName=body_font
         )
         for i, fact in enumerate(facts, start=1):
             story.append(Paragraph(f"{i}. {fact}", fact_style))
@@ -526,6 +670,7 @@ def handle_email(subject: str, sender: str, body: str,
     processed = load_processed()
     all_extracted_text   = []
     all_columns_by_page: dict[str, list[str]] = {}
+    detected_language    = "English"   # updated as files are processed
 
     for file_path in attachment_paths:
         filename = os.path.basename(file_path)
@@ -535,13 +680,19 @@ def handle_email(subject: str, sender: str, body: str,
             log(f"  [STEP 3] '{filename}' already processed — skipping extraction.")
             continue
 
-        txt_path, text = extract_and_save_text(file_path)
+        txt_path, text, lang = extract_and_save_text(file_path)
         if not text.strip():
             log(f"  [STEP 3] No text extracted from '{filename}' — skipping.")
             continue
 
         all_extracted_text.append(f"=== {filename} ===\n{text}")
         mark_processed(filename)
+
+        # Track the dominant language (Hindi takes priority over English)
+        if lang in ("Unicode Hindi", "Krutidev→Unicode"):
+            detected_language = lang
+        elif detected_language == "English":
+            detected_language = lang
 
         # ── STEP 4: Gemini — extract column headers (+ print table analysis) ──
         columns_by_page = get_columns_from_gemini(text)
@@ -553,8 +704,11 @@ def handle_email(subject: str, sender: str, body: str,
         log("  No text extracted from any attachment — skipping reply.")
         return
 
-    # ── STEP 5: OpenClaw ──────────────────────────────────────────────────
-    result = call_openclaw(subject, sender, body, all_columns_by_page)
+    log(f"  [PIPELINE] Detected language for reply: {detected_language}")
+
+    # ── STEP 5: OpenClaw ─────────────────────────────────────────────────────
+    result = call_openclaw(subject, sender, body, all_columns_by_page,
+                           language=detected_language)
 
     if not result:
         log("  [STEP 5] OpenClaw returned no result — sending text-only fallback reply.")
@@ -577,7 +731,25 @@ def handle_email(subject: str, sender: str, body: str,
     facts      = result.get("data_used_in_reply", {}).get("facts", []) or \
                  result.get("facts", [])
 
-    # ── STEP 6: Create PDF ────────────────────────────────────────────────
+    # ── If original was Krutidev, convert OpenClaw's Unicode reply back ───────
+    if detected_language == "Krutidev→Unicode":
+        log("  [PIPELINE] Converting OpenClaw reply from Unicode → Krutidev ASCII …")
+        suggested_reply = unicode_to_krutidev(suggested_reply)
+        # Convert table headers and rows
+        if table_data:
+            table_data = dict(table_data)  # shallow copy
+            if "headers" in table_data:
+                table_data["headers"] = [
+                    unicode_to_krutidev(str(h)) for h in table_data["headers"]
+                ]
+            if "rows" in table_data:
+                table_data["rows"] = [
+                    [unicode_to_krutidev(str(c)) for c in row]
+                    for row in table_data["rows"]
+                ]
+        facts = [unicode_to_krutidev(str(f)) for f in facts]
+
+    # ── STEP 6: Create PDF in the detected language ───────────────────────
     os.makedirs(ATTACHMENT_DIR, exist_ok=True)
     ts      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     pdf_out = os.path.join(ATTACHMENT_DIR, f"reply_{ts}.pdf")
@@ -585,7 +757,8 @@ def handle_email(subject: str, sender: str, body: str,
     pdf_path = None
     if table_data and table_data.get("headers"):
         try:
-            pdf_path = create_reply_pdf(table_data, subject, facts, pdf_out)
+            pdf_path = create_reply_pdf(table_data, subject, facts, pdf_out,
+                                        language=detected_language)
         except Exception as e:
             log(f"  [STEP 6] PDF creation failed: {e}")
     else:

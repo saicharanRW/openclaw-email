@@ -102,6 +102,88 @@ def krutidev_to_unicode(text):
     return text.strip()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Reverse converter: Unicode (Devanagari) → Krutidev ASCII
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_unicode_to_krutidev_map():
+    """
+    Build a sorted list of (unicode_str, krutidev_str) pairs derived from MAIN.
+    Sorted longest-unicode-key first so multi-char sequences are matched before
+    single chars (greedy replacement).
+    Skips ambiguous entries where the same Unicode maps to multiple Krutidev codes.
+    """
+    seen_unicode = {}
+    for krutidev_char, unicode_char in MAIN:
+        # Only include pure Devanagari/Unicode targets (skip ASCII-only mappings
+        # that are just punctuation remaps with no Devanagari)
+        if any('\u0900' <= c <= '\u097f' for c in unicode_char):
+            if unicode_char not in seen_unicode:
+                seen_unicode[unicode_char] = krutidev_char
+            # If already seen, keep the first (earlier in MAIN = higher priority)
+    # Sort by length of unicode key descending so longer sequences match first
+    return sorted(seen_unicode.items(), key=lambda x: len(x[0]), reverse=True)
+
+
+_UNICODE_TO_KRUTIDEV_MAP = None
+
+
+def unicode_to_krutidev(text: str) -> str:
+    """
+    Convert Unicode Devanagari text back to Krutidev ASCII encoding.
+
+    This is a best-effort reverse conversion. Because Krutidev→Unicode is a
+    many-to-one mapping (multiple Krutidev sequences can produce the same
+    Unicode), the reverse may not be byte-for-byte identical to the original
+    Krutidev source, but it will render correctly with a Krutidev font.
+
+    Non-Devanagari characters (ASCII, punctuation, digits) are passed through
+    unchanged, with a few common substitutions (purna viram → A, etc.).
+    """
+    global _UNICODE_TO_KRUTIDEV_MAP
+    if _UNICODE_TO_KRUTIDEV_MAP is None:
+        _UNICODE_TO_KRUTIDEV_MAP = _build_unicode_to_krutidev_map()
+
+    # Common standalone substitutions not covered by MAIN
+    extra = [
+        ('\u0964', 'A'),   # ।  → A  (purna viram / full stop)
+        ('\u0965', 'AA'),  # ॥  → AA (double danda)
+        ('\u0966', '\xe5'), # ०  → å
+        ('\u0967', '\xf8'), # १  → (Kruti Dev digit 1 mapping)
+        ('\u0968', '\xf9'), # २
+        ('\u0969', '\xfa'), # ३
+        ('\u096a', '\xfb'), # ४
+        ('\u096b', '\xfc'), # ५
+        ('\u096c', '\xfd'), # ६
+        ('\u096d', '\xfe'), # ७
+        ('\u096e', '\xff'), # ८
+        ('\u096f', '\u0152'), # ९
+        ('\u0902', 'a'),   # ं  → a (anusvara)
+        ('\u0901', '\xa1'), # ँ  → ¡ (chandrabindu)
+        ('\u093e', 'k'),   # ा  → k
+        ('\u093f', 'f'),   # ि  → f  (handled specially below)
+        ('\u0940', 'h'),   # ी  → h
+        ('\u0941', 'q'),   # ु  → q
+        ('\u0942', 'w'),   # ू  → w
+        ('\u0943', '`'),   # ृ  → `
+        ('\u0947', 's'),   # े  → s
+        ('\u0948', 'S'),   # ै  → S
+        ('\u094b', 'ks'),  # ो  → ks
+        ('\u094c', 'kS'),  # ौ  → kS
+        ('\u094d', '~'),   # ्  → ~
+    ]
+
+    # Apply MAIN-derived reverse map (longest first)
+    for uni, kru in _UNICODE_TO_KRUTIDEV_MAP:
+        text = text.replace(uni, kru)
+
+    # Apply extra standalone substitutions (longest first to avoid conflicts)
+    for uni, kru in sorted(extra, key=lambda x: len(x[0]), reverse=True):
+        text = text.replace(uni, kru)
+
+    return text
+
+
 def convert_file(input_file, output_file):
     """
     Convert a file from Krutidev to Unicode
