@@ -339,29 +339,24 @@ def call_openclaw(subject: str, sender: str, body: str,
     We additionally expect the skill to populate table_data so we can build
     a structured PDF. The skill is prompted to include it.
     """
-    # Flatten all unique column headers across tables
-    all_columns: list[str] = []
-    seen: set[str] = set()
-    for cols in columns_by_page.values():
-        for c in cols:
-            if c not in seen:
-                all_columns.append(c)
-                seen.add(c)
-
-    # Determine human-readable language label for the prompt
-    is_krutidev = language == "Krutidev→Unicode"
-    is_hindi    = language in ("Unicode Hindi", "Krutidev→Unicode")
-    # We always ask OpenClaw to respond in Unicode Hindi (Devanagari).
-    # If the original was Krutidev, we reverse-convert the reply ourselves.
-    lang_label = "Hindi (Devanagari Unicode script)" if is_hindi else "English"
+    # Determine human-readable language label for the prompt (to help OpenClaw understand the input)
+    is_hindi = language in ("Unicode Hindi", "Krutidev→Unicode")
+    input_lang_label = "Hindi" if is_hindi else "English"
 
     prompt = f"""Use the email-context-responder skill.
 
-IMPORTANT: The email and its attachments are written in {lang_label}.
-Your entire response — including the 'suggested_reply' field and all table data —
-MUST be written in {lang_label}. Do NOT translate to any other language.
+IMPORTANT: The email and its attachments are written in {input_lang_label}.
+However, your entire response — including the 'suggested_reply' field and all table data —
+MUST be written in English only. Do NOT use any Hindi or Devanagari script.
 
-DETECTED COLUMNS (from attachment): {json.dumps(all_columns, ensure_ascii=False)}
+AVAILABLE TABLES & COLUMNS (extracted from attachments):
+{json.dumps(columns_by_page, indent=2, ensure_ascii=False)}
+
+Your response MUST include a 'tables' field which is a LIST of objects.
+Each object in the 'tables' list should have:
+  - 'title': A short descriptive title for the table.
+  - 'headers': The list of column headers.
+  - 'rows': A list of lists representing the data rows.
 
 EMAIL:
 Subject : {json.dumps(subject)}
@@ -385,8 +380,8 @@ Body    :
         resp = requests.post(OPENCLAW_URL, headers=headers, json=payload, timeout=90)
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"]
-        log("--- OpenClaw response (first 400 chars) ---")
-        log(raw[:400])
+        log("--- OpenClaw response (first 25000 chars) ---")
+        log(raw[:25000])
         log("-------------------------------------------")
         return _parse_json(raw)
     except Exception as e:
@@ -513,18 +508,15 @@ def _ensure_hindi_font() -> tuple[str, str]:
         return "Helvetica", "Helvetica-Bold"
 
 
-def create_reply_pdf(table_data: dict, subject: str, facts: list,
+def create_reply_pdf(tables: list[dict], subject: str, facts: list,
                      output_path: str, language: str = "English") -> str:
     """
-    Create a styled PDF with table + facts in the detected language.
+    Create a styled PDF with multiple tables + facts in the detected language.
     - "Krutidev→Unicode" : convert text back to Krutidev ASCII, use Kruti Dev font
     - "Unicode Hindi"    : use NotoSansDevanagari font
     - "English"          : use Helvetica
     Returns output_path.
     """
-    headers = table_data.get("headers", [])
-    rows    = table_data.get("rows", [])
-
     is_krutidev = language == "Krutidev→Unicode"
     is_hindi    = language in ("Unicode Hindi", "Krutidev→Unicode")
 
@@ -538,7 +530,7 @@ def create_reply_pdf(table_data: dict, subject: str, facts: list,
         body_font, bold_font = "Helvetica", "Helvetica-Bold"
         log("  [STEP 6] PDF language: English — using Helvetica")
 
-    page_size = landscape(A4) if len(headers) > 5 else A4
+    page_size = landscape(A4) # default to landscape for safety with multiple tables
     doc = SimpleDocTemplate(
         output_path,
         pagesize=page_size,
@@ -570,30 +562,45 @@ def create_reply_pdf(table_data: dict, subject: str, facts: list,
         "Hdr", parent=styles["Normal"], fontSize=8, leading=10,
         textColor=colors.white, fontName=bold_font
     )
+    tbl_title_style = ParagraphStyle(
+        "TblTitle", parent=styles["Heading3"], fontSize=10, spaceAfter=5,
+        fontName=bold_font
+    )
 
-    if headers:
-        table_body = [[Paragraph(str(h), hdr_style) for h in headers]]
-        for row in rows:
-            padded = (list(row) + [""] * len(headers))[: len(headers)]
-            table_body.append([Paragraph(str(c), cell_style) for c in padded])
+    if tables:
+        for i, table_data in enumerate(tables, start=1):
+            title = table_data.get("title", f"Table {i}")
+            headers = table_data.get("headers", [])
+            rows = table_data.get("rows", [])
 
-        usable_w  = page_size[0] - 3 * cm
-        col_w     = usable_w / len(headers)
-        tbl = Table(table_body, colWidths=[col_w] * len(headers), repeatRows=1)
-        tbl.setStyle(TableStyle([
-            ("BACKGROUND",     (0, 0), (-1, 0), colors.HexColor("#2C3E50")),
-            ("TEXTCOLOR",      (0, 0), (-1, 0), colors.white),
-            ("FONTNAME",       (0, 0), (-1, 0), bold_font),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
-                [colors.white, colors.HexColor("#F2F2F2")]),
-            ("GRID",           (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
-            ("VALIGN",         (0, 0), (-1, -1), "TOP"),
-            ("TOPPADDING",     (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING",  (0, 0), (-1, -1), 4),
-            ("LEFTPADDING",    (0, 0), (-1, -1), 4),
-            ("RIGHTPADDING",   (0, 0), (-1, -1), 4),
-        ]))
-        story.append(tbl)
+            if not headers:
+                continue
+
+            story.append(Paragraph(title, tbl_title_style))
+            
+            table_body = [[Paragraph(str(h), hdr_style) for h in headers]]
+            for row in rows:
+                padded = (list(row) + [""] * len(headers))[: len(headers)]
+                table_body.append([Paragraph(str(c), cell_style) for c in padded])
+
+            usable_w  = page_size[0] - 3 * cm
+            col_w     = usable_w / len(headers)
+            tbl = Table(table_body, colWidths=[col_w] * len(headers), repeatRows=1)
+            tbl.setStyle(TableStyle([
+                ("BACKGROUND",     (0, 0), (-1, 0), colors.HexColor("#2C3E50")),
+                ("TEXTCOLOR",      (0, 0), (-1, 0), colors.white),
+                ("FONTNAME",       (0, 0), (-1, 0), bold_font),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+                    [colors.white, colors.HexColor("#F2F2F2")]),
+                ("GRID",           (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+                ("VALIGN",         (0, 0), (-1, -1), "TOP"),
+                ("TOPPADDING",     (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING",  (0, 0), (-1, -1), 4),
+                ("LEFTPADDING",    (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING",   (0, 0), (-1, -1), 4),
+            ]))
+            story.append(tbl)
+            story.append(Spacer(1, 0.5 * cm))
     else:
         story.append(Paragraph(
             "No structured table data was returned by OpenClaw.",
@@ -727,42 +734,30 @@ def handle_email(subject: str, sender: str, body: str,
     suggested_reply = result.get("suggested_reply", "").strip() or (
         "Please find the extracted data attached.\n\nRegards,\nAuto-Reply System"
     )
-    table_data = result.get("table_data", {})
-    facts      = result.get("data_used_in_reply", {}).get("facts", []) or \
-                 result.get("facts", [])
+    
+    # Extract multiple tables if present, otherwise fallback to single table_data
+    tables = result.get("tables", [])
+    if not tables and result.get("table_data"):
+        tables = [result["table_data"]]
 
-    # ── If original was Krutidev, convert OpenClaw's Unicode reply back ───────
-    if detected_language == "Krutidev→Unicode":
-        log("  [PIPELINE] Converting OpenClaw reply from Unicode → Krutidev ASCII …")
-        suggested_reply = unicode_to_krutidev(suggested_reply)
-        # Convert table headers and rows
-        if table_data:
-            table_data = dict(table_data)  # shallow copy
-            if "headers" in table_data:
-                table_data["headers"] = [
-                    unicode_to_krutidev(str(h)) for h in table_data["headers"]
-                ]
-            if "rows" in table_data:
-                table_data["rows"] = [
-                    [unicode_to_krutidev(str(c)) for c in row]
-                    for row in table_data["rows"]
-                ]
-        facts = [unicode_to_krutidev(str(f)) for f in facts]
+    facts = result.get("data_used_in_reply", {}).get("facts", []) or \
+            result.get("facts", [])
 
-    # ── STEP 6: Create PDF in the detected language ───────────────────────
+    # ── STEP 6: Create PDF (Always English) ───────────────────────────────
     os.makedirs(ATTACHMENT_DIR, exist_ok=True)
     ts      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     pdf_out = os.path.join(ATTACHMENT_DIR, f"reply_{ts}.pdf")
 
     pdf_path = None
-    if table_data and table_data.get("headers"):
+    if tables:
         try:
-            pdf_path = create_reply_pdf(table_data, subject, facts, pdf_out,
-                                        language=detected_language)
+            # We now force 'English' for the PDF to ensure English fonts and labels
+            pdf_path = create_reply_pdf(tables, subject, facts, pdf_out,
+                                        language="English")
         except Exception as e:
             log(f"  [STEP 6] PDF creation failed: {e}")
     else:
-        log("  [STEP 6] No table_data from OpenClaw — sending text-only reply.")
+        log("  [STEP 6] No table data from OpenClaw — sending text-only reply.")
 
     # ── STEP 6: Send reply ────────────────────────────────────────────────
     send_reply(sender, subject, suggested_reply, pdf_path)
