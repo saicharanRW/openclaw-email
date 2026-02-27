@@ -86,7 +86,7 @@ except:
 
 # Try to import custom DOCX extractor if available
 try:
-    from extract_docx_text import extract_text as extract_docx_krutidev
+    from extract_text import extract_text as extract_docx_krutidev
     CUSTOM_DOCX_EXTRACTOR = True
 except:
     CUSTOM_DOCX_EXTRACTOR = False
@@ -437,21 +437,19 @@ def extract_supported_attachments(msg: pyzmail.PyzMessage) -> list[str]:
 # OPENAI TABLE/COLUMN EXTRACTION + DOCUMENT BRIEF
 # ══════════════════════════════════════════════════════════════════════════════
 
-OPENAI_TABLE_SYSTEM = "You are a document analysis assistant. Extract table column headers from document text and return only a JSON array of strings. No explanation, no markdown, no code blocks."
+OPENAI_TABLE_SYSTEM = "You are a document analysis assistant. Extract table column headers from document text and return only a JSON object. No explanation, no markdown, no code blocks."
 
 OPENAI_TABLE_USER = """This is the extracted text content from a document.
 
 Your task:
-1. Find if there are any tables in this text.
-2. Extract ONLY the column header names from the table(s).
-3. Return the column names as a JSON array of strings.
-4. If there are multiple tables, extract headers from all of them.
-5. Return ONLY the JSON array — no explanation, no markdown, no code blocks.
+1. Find ALL tables present in this text.
+2. For each table, number it sequentially (table_1, table_2, ...).
+3. Extract ONLY the column header names from each table.
+4. Return ONLY a JSON object in this exact format — no explanation, no markdown, no code blocks:
 
-Example output:
-["Sr. No.", "Name", "Date", "Status", "Remarks"]
+{{"columns_by_table": {{"table_1": ["Col A", "Col B"], "table_2": ["Col X", "Col Y"]}}}}
 
-If no table is found, return an empty array: []
+If no table is found, return: {{"columns_by_table": {{}}}}
 
 TEXT CONTENT:
 {text_content}
@@ -503,14 +501,19 @@ TEXT CONTENT:
 """
 
 
-def extract_columns_from_text(text: str) -> list[str]:
-    """Send extracted text to OpenAI to find tables and extract column headers."""
+def extract_columns_from_text(text: str) -> dict[str, list[str]]:
+    """
+    Send extracted text to OpenAI to find ALL tables and extract their column
+    headers separately.
+
+    Returns a dict like: {"table_1": ["Col A", "Col B"], "table_2": [...]}
+    """
     try:
         max_chars = 50000
         if len(text) > max_chars:
             log(f"    Truncating text from {len(text):,} to {max_chars:,} chars")
             text = text[:max_chars] + "\n...[truncated]"
-        
+
         log(f"    Sending to OpenAI to find tables...")
         response = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -521,24 +524,25 @@ def extract_columns_from_text(text: str) -> list[str]:
             temperature=0,
         )
         raw = response.choices[0].message.content.strip()
-        
+
         if raw.startswith("```"):
             raw = raw.replace("```json", "").replace("```", "").strip()
-        start, end = raw.find("["), raw.rfind("]")
+        start, end = raw.find("{"), raw.rfind("}")
         if start == -1 or end == -1:
-            log(f"    No table found.")
-            return []
-        
-        columns = json.loads(raw[start:end + 1])
-        if columns:
-            log(f"    ✓ Found columns: {columns}")
+            log(f"    No tables found.")
+            return {}
+
+        parsed = json.loads(raw[start:end + 1])
+        columns_by_table: dict[str, list[str]] = parsed.get("columns_by_table", {})
+        if columns_by_table:
+            log(f"    ✓ Found {len(columns_by_table)} table(s): {columns_by_table}")
         else:
-            log(f"    No table found.")
-        return columns
-        
+            log(f"    No tables found.")
+        return columns_by_table
+
     except Exception as e:
         log(f"    OpenAI API error: {e}")
-        return []
+        return {}
 
 
 def get_document_brief(text: str) -> dict | None:
@@ -583,11 +587,14 @@ def get_document_brief(text: str) -> dict | None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def call_openclaw(subject: str, sender: str, body: str,
-                  all_columns: list[str], document_brief: dict | None = None) -> dict | None:
+                  columns_by_table: dict[str, list[str]],
+                  document_brief: dict | None = None) -> dict | None:
     """
-    Sends email context + detected column headers + document brief to OpenClaw.
+    Sends email context + detected column headers (per table) + document brief
+    to OpenClaw.  Asks OpenClaw to return a 'tables' list so each table is
+    populated separately.
     """
-    
+
     brief_section = ""
     if document_brief:
         brief_section = f"""
@@ -602,11 +609,23 @@ Key Entities:
   - Reference Numbers: {', '.join(document_brief.get('key_entities', {}).get('reference_numbers', []))}
   - People: {', '.join(document_brief.get('key_entities', {}).get('people', []))}
 """
-    
+
     prompt = f"""Use the email-context-responder skill.
 
-DETECTED COLUMNS (from attachment): {json.dumps(all_columns, ensure_ascii=False)}
+IMPORTANT: Your entire response — including the 'suggested_reply' field and all
+table data — MUST be written in English only.
+
+AVAILABLE TABLES & COLUMNS (extracted from attachment):
+{json.dumps(columns_by_table, indent=2, ensure_ascii=False)}
 {brief_section}
+Your response MUST include a 'tables' field which is a LIST of objects.
+Each object in the 'tables' list MUST have:
+  - 'title':   A short descriptive title for the table.
+  - 'headers': The list of column headers (use the headers above for that table).
+  - 'rows':    A list of lists representing ALL data rows for that table.
+
+Return one entry in 'tables' for EVERY table key listed in AVAILABLE TABLES above.
+
 EMAIL:
 Subject : {json.dumps(subject)}
 From    : {json.dumps(sender)}
@@ -628,8 +647,8 @@ Body    :
         resp = requests.post(OPENCLAW_URL, headers=headers, json=payload, timeout=90)
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"]
-        log("  --- OpenClaw response (first 400 chars) ---")
-        log(raw[:400])
+        log("  --- OpenClaw response (first 25000 chars) ---")
+        log(raw[:25000])
         log("  -------------------------------------------")
         return _parse_json(raw)
     except Exception as e:
@@ -656,22 +675,21 @@ def _parse_json(raw: str) -> dict | None:
 # REPLY DOCUMENT CREATION - SAME FORMAT AS RECEIVED
 # ══════════════════════════════════════════════════════════════════════════════
 
-def create_reply_pdf(table_data: dict, subject: str, output_path: str,
+def create_reply_pdf(tables: list[dict], subject: str, output_path: str,
                      facts: list[str] | None = None) -> str:
     """
-    Creates a styled PDF with table data.
-    FIXED: uses NotoSansDevanagari per-cell so Hindi text renders correctly
-    instead of showing black boxes.
+    Creates a styled PDF with MULTIPLE tables (one section per table).
+    Each item in *tables* must have 'title', 'headers', and 'rows' keys.
+    Falls back gracefully when a table has no headers.
+    Uses NotoSansDevanagari per-cell so Hindi text renders correctly.
     """
     _load_hindi_fonts()  # ensure font registered before building PDF
 
-    headers = table_data.get("headers", [])
-    rows    = table_data.get("rows", [])
+    # Backwards‑compat: accept a single dict as well
+    if isinstance(tables, dict):
+        tables = [tables]
 
-    if not headers:
-        raise ValueError("No headers provided for PDF creation.")
-
-    page_size = landscape(A4) if len(headers) > 5 else A4
+    page_size = landscape(A4)
     doc = SimpleDocTemplate(
         output_path, pagesize=page_size,
         leftMargin=1.5 * cm, rightMargin=1.5 * cm,
@@ -691,8 +709,7 @@ def create_reply_pdf(table_data: dict, subject: str, output_path: str,
     ))
     story.append(Spacer(1, 0.5 * cm))
 
-    # ── Two styles per role: Latin (Helvetica) + Hindi (Noto/fallback) ─────
-    # _smart_paragraph() picks the right one per cell at render time.
+    # ── Paragraph styles ───────────────────────────────────────────────────
     cell_latin = ParagraphStyle("CellLatin", parent=styles["Normal"],
                                 fontSize=8, leading=11, fontName="Helvetica")
     cell_hindi = ParagraphStyle("CellHindi", parent=styles["Normal"],
@@ -703,34 +720,57 @@ def create_reply_pdf(table_data: dict, subject: str, output_path: str,
     hdr_hindi  = ParagraphStyle("HdrHindi", parent=styles["Normal"],
                                 fontSize=8, leading=11,
                                 textColor=colors.white, fontName=_hindi_font_bold)
+    tbl_title_style = ParagraphStyle("TblTitle", parent=styles["Heading3"],
+                                     fontSize=10, spaceAfter=5,
+                                     fontName="Helvetica-Bold")
 
-    # ── Build table ─────────────────────────────────────────────────────────
-    table_body = [[_smart_paragraph(str(h), hdr_latin, hdr_hindi) for h in headers]]
-    for row in rows:
-        padded = list(row) + [""] * (len(headers) - len(row))
-        padded = padded[:len(headers)]
-        table_body.append([
-            _smart_paragraph(str(cell), cell_latin, cell_hindi) for cell in padded
-        ])
+    if tables:
+        for i, table_data in enumerate(tables, start=1):
+            title   = table_data.get("title", f"Table {i}")
+            headers = table_data.get("headers", [])
+            rows    = table_data.get("rows", [])
 
-    usable_width = page_size[0] - 3 * cm
-    col_width    = usable_width / len(headers)
-    col_widths   = [col_width] * len(headers)
+            if not headers:
+                continue
 
-    tbl = Table(table_body, colWidths=col_widths, repeatRows=1)
-    tbl.setStyle(TableStyle([
-        ("BACKGROUND",     (0, 0), (-1, 0), colors.HexColor("#2C3E50")),
-        ("TEXTCOLOR",      (0, 0), (-1, 0), colors.white),
-        ("FONTNAME",       (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F2F2F2")]),
-        ("GRID",           (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
-        ("VALIGN",         (0, 0), (-1, -1), "TOP"),
-        ("TOPPADDING",     (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING",  (0, 0), (-1, -1), 4),
-        ("LEFTPADDING",    (0, 0), (-1, -1), 4),
-        ("RIGHTPADDING",   (0, 0), (-1, -1), 4),
-    ]))
-    story.append(tbl)
+            story.append(Paragraph(title, tbl_title_style))
+
+            # ── Build ReportLab table ──────────────────────────────────────
+            table_body = [[_smart_paragraph(str(h), hdr_latin, hdr_hindi)
+                           for h in headers]]
+            for row in rows:
+                padded = list(row) + [""] * (len(headers) - len(row))
+                padded = padded[:len(headers)]
+                table_body.append([
+                    _smart_paragraph(str(cell), cell_latin, cell_hindi)
+                    for cell in padded
+                ])
+
+            usable_width = page_size[0] - 3 * cm
+            col_width    = usable_width / len(headers)
+
+            tbl = Table(table_body, colWidths=[col_width] * len(headers),
+                        repeatRows=1)
+            tbl.setStyle(TableStyle([
+                ("BACKGROUND",     (0, 0), (-1, 0), colors.HexColor("#2C3E50")),
+                ("TEXTCOLOR",      (0, 0), (-1, 0), colors.white),
+                ("FONTNAME",       (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+                    [colors.white, colors.HexColor("#F2F2F2")]),
+                ("GRID",           (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+                ("VALIGN",         (0, 0), (-1, -1), "TOP"),
+                ("TOPPADDING",     (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING",  (0, 0), (-1, -1), 4),
+                ("LEFTPADDING",    (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING",   (0, 0), (-1, -1), 4),
+            ]))
+            story.append(tbl)
+            story.append(Spacer(1, 0.5 * cm))
+    else:
+        story.append(Paragraph(
+            "No structured table data was returned by OpenClaw.",
+            styles["Normal"]
+        ))
 
     # ── Source facts ─────────────────────────────────────────────────────────
     if facts:
@@ -751,148 +791,206 @@ def create_reply_pdf(table_data: dict, subject: str, output_path: str,
     return output_path
 
 
-def create_reply_docx(table_data: dict, subject: str, output_path: str,
+def create_reply_docx(tables: list[dict], subject: str, output_path: str,
                       facts: list[str] | None = None) -> str:
-    """Creates a DOCX with table data."""
-    headers = table_data.get("headers", [])
-    rows    = table_data.get("rows", [])
+    """Creates a DOCX with MULTIPLE tables (one section per table)."""
 
-    if not headers:
-        raise ValueError("No headers provided for DOCX creation.")
+    # Backwards-compat: accept a single dict as well
+    if isinstance(tables, dict):
+        tables = [tables]
 
     doc = docx.Document()
-    
+
     title = doc.add_heading(f"Response: {subject}", level=1)
     title.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    
+
     doc.add_paragraph(f"Generated on {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    doc.add_paragraph()
-    
-    table = doc.add_table(rows=len(rows) + 1, cols=len(headers))
-    table.style = 'Light Grid Accent 1'
-    
-    header_cells = table.rows[0].cells
-    for i, header in enumerate(headers):
-        cell = header_cells[i]
-        cell.text = str(header)
-        for paragraph in cell.paragraphs:
-            for run in paragraph.runs:
-                run.font.bold = True
-                run.font.size = Pt(11)
-    
-    for row_idx, row_data in enumerate(rows, start=1):
-        row_cells = table.rows[row_idx].cells
-        for col_idx, cell_data in enumerate(row_data):
-            if col_idx < len(headers):
-                row_cells[col_idx].text = str(cell_data)
-    
+
+    any_table_added = False
+    for i, table_data in enumerate(tables, start=1):
+        title_text = table_data.get("title", f"Table {i}")
+        headers    = table_data.get("headers", [])
+        rows       = table_data.get("rows", [])
+
+        if not headers:
+            continue
+
+        doc.add_paragraph()
+        doc.add_heading(title_text, level=2)
+
+        table = doc.add_table(rows=len(rows) + 1, cols=len(headers))
+        table.style = 'Light Grid Accent 1'
+
+        header_cells = table.rows[0].cells
+        for j, header in enumerate(headers):
+            cell = header_cells[j]
+            cell.text = str(header)
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    run.font.bold = True
+                    run.font.size = Pt(11)
+
+        for row_idx, row_data in enumerate(rows, start=1):
+            row_cells = table.rows[row_idx].cells
+            for col_idx, cell_data in enumerate(row_data):
+                if col_idx < len(headers):
+                    row_cells[col_idx].text = str(cell_data)
+
+        any_table_added = True
+
+    if not any_table_added:
+        raise ValueError("No tables with headers provided for DOCX creation.")
+
     if facts:
         doc.add_paragraph()
         doc.add_heading("Source Facts", level=2)
         for i, fact in enumerate(facts, start=1):
             doc.add_paragraph(f"{i}. {fact}", style='List Number')
-    
+
     doc.save(output_path)
     log(f"  Reply DOCX created: {output_path}")
     return output_path
 
 
-def create_reply_xlsx(table_data: dict, subject: str, output_path: str,
+def create_reply_xlsx(tables: list[dict], subject: str, output_path: str,
                       facts: list[str] | None = None) -> str:
-    """Creates an XLSX with table data."""
-    headers = table_data.get("headers", [])
-    rows    = table_data.get("rows", [])
-
-    if not headers:
-        raise ValueError("No headers provided for XLSX creation.")
+    """
+    Creates an XLSX with MULTIPLE tables — one sheet per table.
+    A 'Source Facts' sheet is appended when facts are present.
+    """
+    # Backwards-compat: accept a single dict as well
+    if isinstance(tables, dict):
+        tables = [tables]
 
     wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Response Data"
-    
-    ws.append([f"Response: {subject}"])
-    ws.append([f"Generated on {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"])
-    ws.append([])
-    
-    header_row = ws.max_row + 1
-    ws.append(headers)
-    for cell in ws[header_row]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-    
-    for row_data in rows:
-        padded = list(row_data) + [""] * (len(headers) - len(row_data))
-        padded = padded[:len(headers)]
-        ws.append(padded)
-    
-    for column in ws.columns:
-        max_length = 0
-        column_letter = column[0].column_letter
-        for cell in column:
-            try:
-                if len(str(cell.value)) > max_length:
-                    max_length = len(str(cell.value))
-            except:
-                pass
-        adjusted_width = min(max_length + 2, 50)
-        ws.column_dimensions[column_letter].width = adjusted_width
-    
+    # Remove the default empty sheet; we'll create named sheets per table
+    default_ws = wb.active
+
+    any_sheet_added = False
+    for i, table_data in enumerate(tables, start=1):
+        sheet_title = table_data.get("title", f"Table {i}")[:31]  # Excel max 31 chars
+        headers = table_data.get("headers", [])
+        rows    = table_data.get("rows", [])
+
+        if not headers:
+            continue
+
+        ws = wb.create_sheet(title=sheet_title)
+
+        ws.append([f"Response: {subject}"])
+        ws.append([f"Generated on {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"])
+        ws.append([])
+
+        header_row = ws.max_row + 1
+        ws.append(headers)
+        for cell in ws[header_row]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill(start_color="2C3E50", end_color="2C3E50",
+                                    fill_type="solid")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        for row_data in rows:
+            padded = list(row_data) + [""] * (len(headers) - len(row_data))
+            padded = padded[:len(headers)]
+            ws.append(padded)
+
+        for column in ws.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except Exception:
+                    pass
+            ws.column_dimensions[column_letter].width = min(max_length + 2, 50)
+
+        any_sheet_added = True
+
+    if not any_sheet_added:
+        raise ValueError("No tables with headers provided for XLSX creation.")
+
+    # Remove the blank default sheet
+    if default_ws.title in wb.sheetnames and default_ws != wb.worksheets[0]:
+        wb.remove(default_ws)
+    elif default_ws.max_row == 1 and default_ws.max_column == 1:
+        wb.remove(default_ws)
+
     if facts:
         ws2 = wb.create_sheet("Source Facts")
         ws2.append(["Source Facts"])
         ws2.append([])
         for i, fact in enumerate(facts, start=1):
             ws2.append([f"{i}. {fact}"])
-    
+
     wb.save(output_path)
     log(f"  Reply XLSX created: {output_path}")
     return output_path
 
 
-def create_reply_csv(table_data: dict, output_path: str) -> str:
-    """Creates a CSV with table data."""
-    headers = table_data.get("headers", [])
-    rows    = table_data.get("rows", [])
-
-    if not headers:
-        raise ValueError("No headers provided for CSV creation.")
+def create_reply_csv(tables: list[dict], output_path: str) -> str:
+    """
+    Creates a CSV with MULTIPLE tables separated by blank lines.
+    A title row is written before each table's headers.
+    """
+    # Backwards-compat: accept a single dict as well
+    if isinstance(tables, dict):
+        tables = [tables]
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv_module.writer(f)
-        writer.writerow(headers)
-        for row_data in rows:
-            padded = list(row_data) + [""] * (len(headers) - len(row_data))
-            padded = padded[:len(headers)]
-            writer.writerow(padded)
-    
+        any_written = False
+        for i, table_data in enumerate(tables, start=1):
+            title   = table_data.get("title", f"Table {i}")
+            headers = table_data.get("headers", [])
+            rows    = table_data.get("rows", [])
+
+            if not headers:
+                continue
+
+            if any_written:
+                writer.writerow([])   # blank separator between tables
+
+            writer.writerow([title])
+            writer.writerow(headers)
+            for row_data in rows:
+                padded = list(row_data) + [""] * (len(headers) - len(row_data))
+                padded = padded[:len(headers)]
+                writer.writerow(padded)
+            any_written = True
+
+        if not any_written:
+            raise ValueError("No tables with headers provided for CSV creation.")
+
     log(f"  Reply CSV created: {output_path}")
     return output_path
 
 
-def create_reply_document(table_data: dict, subject: str, original_extension: str,
+def create_reply_document(tables: list[dict], subject: str, original_extension: str,
                           facts: list[str] | None = None) -> str:
     """
     Creates reply document in the SAME FORMAT as the original attachment.
     PDF → PDF, DOCX → DOCX, XLSX → XLSX, CSV → CSV
+    Supports multiple tables — each creator function now receives a list.
     """
     os.makedirs(ATTACHMENT_DIR, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    
+
     dispatch = {
         ".pdf":  (create_reply_pdf,  f"reply_{ts}.pdf"),
         ".docx": (create_reply_docx, f"reply_{ts}.docx"),
         ".xlsx": (create_reply_xlsx, f"reply_{ts}.xlsx"),
         ".csv":  (create_reply_csv,  f"reply_{ts}.csv"),
     }
-    
-    creator_fn, filename = dispatch.get(original_extension, (create_reply_pdf, f"reply_{ts}.pdf"))
+
+    creator_fn, filename = dispatch.get(original_extension,
+                                        (create_reply_pdf, f"reply_{ts}.pdf"))
     output_path = os.path.join(ATTACHMENT_DIR, filename)
-    
+
     if original_extension == ".csv":
-        return creator_fn(table_data, output_path)
+        return creator_fn(tables, output_path)
     else:
-        return creator_fn(table_data, subject, output_path, facts)
+        return creator_fn(tables, subject, output_path, facts)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -962,70 +1060,62 @@ def on_new_email(subject: str, sender: str, body: str,
     log("="*70)
 
     processed = load_processed()
-    all_columns = []
+    all_columns_by_table: dict[str, list[str]] = {}   # {"filename_table_1": [...], ...}
     all_briefs = []
     original_extension = None
-    
+
     for file_path in attachment_paths:
         filename = os.path.basename(file_path)
-        
+
         if filename in processed:
             log(f"  Already processed '{filename}' — skipping.")
             continue
-        
+
         log(f"\n  Processing: {filename}")
         log(f"  {'─'*66}")
-        
+
         extracted_text, extension = extract_document_content(file_path)
-        
+
         if original_extension is None:
             original_extension = extension
-        
+
         if extracted_text is None:
             log(f"    ✗ Extraction failed")
             continue
-        
+
         if not extracted_text.strip():
             log(f"    ⚠ No text extracted (empty document)")
             continue
-        
+
         log(f"    ✓ Extracted {len(extracted_text):,} characters")
-        
         preview = extracted_text[:150].replace('\n', ' ')[:120]
         log(f"    Preview: {preview}...")
-        
+
         brief = get_document_brief(extracted_text)
         if brief:
             all_briefs.append(brief)
-        
-        columns = extract_columns_from_text(extracted_text)
-        all_columns.extend(columns)
-        
+
+        # extract_columns_from_text now returns {"table_1": [...], "table_2": [...]}
+        columns_by_table = extract_columns_from_text(extracted_text)
+        # Namespace by filename so keys are unique across multiple attachments
+        for tbl_key, cols in columns_by_table.items():
+            all_columns_by_table[f"{filename}_{tbl_key}"] = cols
+
         mark_processed(filename)
-    
-    if not all_columns:
+
+    if not all_columns_by_table:
         log("\n  No tables/columns found in any attachment — skipping.")
         return
-    
-    seen = set()
-    unique_columns = []
-    for col in all_columns:
-        if col not in seen:
-            unique_columns.append(col)
-            seen.add(col)
-    
-    log(f"\n  Total unique columns found: {len(unique_columns)}")
-    log(f"  Columns: {unique_columns}")
-    
+
+    log(f"\n  Total tables found: {len(all_columns_by_table)}")
+    for k, v in all_columns_by_table.items():
+        log(f"    {k}: {v}")
+
     combined_brief = None
     if all_briefs:
-        all_topics = []
-        all_dates = []
-        all_locations = []
-        all_ref_nums = []
-        all_people = []
+        all_topics, all_dates, all_locations, all_ref_nums, all_people = [], [], [], [], []
         summaries = []
-        
+
         for brief in all_briefs:
             summaries.append(brief.get('brief_summary', ''))
             all_topics.extend(brief.get('main_topics', []))
@@ -1034,7 +1124,7 @@ def on_new_email(subject: str, sender: str, body: str,
             all_locations.extend(entities.get('locations', []))
             all_ref_nums.extend(entities.get('reference_numbers', []))
             all_people.extend(entities.get('people', []))
-        
+
         combined_brief = {
             'document_type': all_briefs[0].get('document_type', 'Unknown'),
             'brief_summary': ' '.join(summaries),
@@ -1046,49 +1136,56 @@ def on_new_email(subject: str, sender: str, body: str,
                 'people': list(set(all_people))
             }
         }
-        
+
         log(f"\n  Document Brief:")
         log(f"    Type: {combined_brief['document_type']}")
         log(f"    Topics: {combined_brief['main_topics']}")
-    
+
     log("\n  Calling OpenClaw...")
-    result = call_openclaw(subject, sender, body, unique_columns, combined_brief)
-    
+    result = call_openclaw(subject, sender, body, all_columns_by_table, combined_brief)
+
     if not result:
         log("  OpenClaw analysis failed — skipping.")
         return
-    
+
     log(f"\n  Category : {result.get('category', 'unknown')}")
     log(f"  Priority : {result.get('priority', 'unknown')}")
     log(f"  Language : {result.get('language_of_reply', 'unknown')}")
-    
+
     matched = result.get("matched_documents", [])
     if matched:
         log(f"  Matched docs ({len(matched)}): {[d.get('file_name') for d in matched]}")
-    
+
     if result.get("reply_note"):
         log(f"  Note     : {result['reply_note']}")
-    
+
     requires_reply  = result.get("requires_reply", False)
-    table_data      = result.get("table_data", {})
     suggested_reply = result.get("suggested_reply", "").strip()
-    facts           = result.get("data_used_in_reply", {}).get("facts", [])
-    
+    facts           = result.get("data_used_in_reply", {}).get("facts", []) or \
+                      result.get("facts", [])
+
+    # Support both 'tables' (list) and legacy 'table_data' (single dict)
+    tables = result.get("tables", [])
+    if not tables and result.get("table_data"):
+        td = result["table_data"]
+        if td and td.get("headers"):
+            tables = [td]
+
     if not requires_reply:
         log("\n  No reply required per OpenClaw.")
         return
-    
-    if not table_data or not table_data.get("headers"):
+
+    if not tables:
         log("\n  No table data — sending text-only reply.")
         if suggested_reply:
             send_text_only_reply(sender, subject, suggested_reply)
         return
-    
-    log(f"\n  Creating reply in format: {original_extension}")
-    
+
+    log(f"\n  Creating reply in format: {original_extension} ({len(tables)} table(s))")
+
     try:
         reply_path = create_reply_document(
-            table_data,
+            tables,
             subject,
             original_extension or ".pdf",
             facts=facts
@@ -1098,7 +1195,7 @@ def on_new_email(subject: str, sender: str, body: str,
         if suggested_reply:
             send_text_only_reply(sender, subject, suggested_reply)
         return
-    
+
     reply_body = suggested_reply or (
         "Please find the extracted data attached.\n\nRegards,\nAuto-Reply System"
     )

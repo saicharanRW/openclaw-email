@@ -36,3 +36,6 @@ PROCESSED_LOG  = os.environ.get("PROCESSED_LOG", "processed_files.txt")
 
 # ── Polling ───────────────────────────────────────────────────────────────────
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "30"))
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+OPENAI_MODEL = "gpt-4o"
