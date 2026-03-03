@@ -88,7 +88,7 @@ except:
 
 # Try to import custom DOCX extractor if available
 try:
-    from extract_text import extract_text as extract_docx_krutidev
+    from extract_docx_text import extract_text as extract_docx_krutidev
     CUSTOM_DOCX_EXTRACTOR = True
 except:
     CUSTOM_DOCX_EXTRACTOR = False
@@ -1263,20 +1263,47 @@ def on_new_email(subject: str, sender: str, body: str,
         return
 
     # ── Collect all tables from OpenClaw response ───────────────────────────
-    # OpenClaw may return:
-    #   "tables": [{"title":..., "headers":..., "rows":...}, ...]   ← preferred
-    #   "table_data": {"headers":..., "rows":...}                   ← legacy single
-    tables: list[dict] = result.get("tables", [])
+    # The skill can return tables in THREE formats (checked in priority order):
+    #
+    #  Format A — top-level list (legacy):
+    #    result["tables"] = [{"title":..., "headers":..., "rows":...}, ...]
+    #
+    #  Format B — NEW nested multi-table (what updated skill.md produces):
+    #    result["table_data"]["tables"] = [{"title":..., "headers":..., "rows":...}, ...]
+    #
+    #  Format C — legacy single table:
+    #    result["table_data"] = {"headers": [...], "rows": [...]}
+    #
+    tables: list[dict] = []
+
+    # Format A
+    if result.get("tables"):
+        tables = result["tables"]
+        log(f"\n  Tables resolved via Format A (top-level 'tables' key): {len(tables)}")
+
+    # Format B  ← what the updated skill returns
+    if not tables:
+        td = result.get("table_data") or {}
+        if isinstance(td, dict) and td.get("tables"):
+            tables = td["tables"]
+            log(f"\n  Tables resolved via Format B (table_data.tables): {len(tables)}")
+
+    # Format C  ← legacy single-table fallback
+    if not tables:
+        td = result.get("table_data") or {}
+        if isinstance(td, dict) and td.get("headers"):
+            tables = [td]
+            log(f"\n  Tables resolved via Format C (legacy single table_data): {len(tables)}")
 
     if not tables:
-        # Legacy: single table_data → wrap in a list
-        td = result.get("table_data", {})
-        if td and td.get("headers"):
-            tables = [td]
-
-    log(f"\n  Tables in OpenClaw response: {len(tables)}")
-    for i, t in enumerate(tables, 1):
-        log(f"    Table {i}: '{t.get('title', '(no title)')}' — {len(t.get('headers', []))} cols, {len(t.get('rows', []))} rows")
+        log(f"\n  table_data in response: {result.get('table_data')}")
+        log(f"\n  Tables in OpenClaw response: 0")
+    else:
+        log(f"\n  Tables in OpenClaw response: {len(tables)}")
+        for i, t in enumerate(tables, 1):
+            n_rows = len(t.get("rows", []))
+            n_cols = len(t.get("headers", []))
+            log(f"    Table {i}: '{t.get('title', '(no title)')}' — {n_cols} cols, {n_rows} rows")
 
     if not tables:
         log("\n  No table data — sending text-only reply.")
