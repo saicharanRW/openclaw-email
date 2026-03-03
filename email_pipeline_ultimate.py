@@ -88,7 +88,7 @@ except:
 
 # Try to import custom DOCX extractor if available
 try:
-    from extract_docx_text import extract_text as extract_docx_krutidev
+    from extract_text import extract_text as extract_docx_krutidev
     CUSTOM_DOCX_EXTRACTOR = True
 except:
     CUSTOM_DOCX_EXTRACTOR = False
